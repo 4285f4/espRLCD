@@ -1,0 +1,2 @@
+# espRLCD
+A simple clock demo for waveshare ESP32-S3-RLCD-4.2.
