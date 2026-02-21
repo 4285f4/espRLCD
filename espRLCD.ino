@@ -5,6 +5,7 @@
 #include <Preferences.h>
 #include <Adafruit_GFX.h>
 #include "time.h"
+#include "driver/gpio.h" // 引入底层 GPIO 库，用于深度睡眠时的引脚锁定
 
 // 引入驱动、字体和 RTC 库
 #include "display_bsp.h"
@@ -13,10 +14,13 @@
 #include "secfont.h"          // DSEG7 36 (小)
 #include "PCF85063A-SOLDERED.h" // RTC 库
 
-// ================= 1. 全局变量 =================
+// ================= 1. RTC 掉电保护内存 (深度睡眠专用) =================
+RTC_DATA_ATTR int rtc_lastSyncDate = -1;
+RTC_DATA_ATTR bool rtc_isFirstBoot = true;
+
+// ================= 2. 全局变量 =================
 bool isConfigMode = false;
 bool shouldSaveConfig = false;
-int lastSyncDate = -1; // 记录上次自动同步的日期
 
 // 配置参数
 char ntpServer[40] = "ntp.aliyun.com";
@@ -35,7 +39,7 @@ char secBuf[5];
 // SHTC3 地址
 static const uint8_t SHTC3_ADDR = 0x70;
 
-// ================= 2. 硬件定义 =================
+// ================= 3. 硬件定义 =================
 #define PIN_CS    12
 #define PIN_SCK   11
 #define PIN_MOSI  5
@@ -50,21 +54,20 @@ static const uint8_t SHTC3_ADDR = 0x70;
 static const int W = 400;
 static const int H = 300;
 
-// ================= 3. 对象实例化 =================
+// ================= 4. 对象实例化 =================
 DisplayPort RlcdPort(PIN_CS, PIN_SCK, PIN_MOSI, PIN_DE, PIN_DIS, W, H);
 GFXcanvas1 canvas(W, H);
 Preferences prefs;
 PCF85063A rtc;
 
-// ================= 4. SHTC3 驱动函数 =================
+// ================= 5. SHTC3 驱动函数 =================
 
 uint8_t crc8(const uint8_t *data, int len) {
     uint8_t crc = 0xFF;
     for (int i = 0; i < len; i++) {
         crc ^= data[i];
         for (int b = 0; b < 8; b++) {
-            crc = (crc & 0x80) ?
-                  (uint8_t)((crc << 1) ^ 0x31) : (uint8_t)(crc << 1);
+            crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x31) : (uint8_t)(crc << 1);
         }
     }
     return crc;
@@ -102,7 +105,7 @@ bool shtc3_read(float &tempC, float &rh) {
     return true;
 }
 
-// ================= 5. 辅助函数 =================
+// ================= 6. 辅助函数 =================
 
 void saveConfigCallback() {
     shouldSaveConfig = true;
@@ -172,7 +175,7 @@ void syncTime() {
             rtc.setTime(t.tm_hour, t.tm_min, t.tm_sec);
             rtc.setDate(t.tm_wday, t.tm_mday, t.tm_mon + 1, t.tm_year + 1900);
             showMessage("Success!");
-            lastSyncDate = t.tm_mday;
+            rtc_lastSyncDate = t.tm_mday;
             delay(1000);
         } else {
             showMessage("NTP Error");
@@ -190,9 +193,15 @@ void syncTime() {
 // ================= 核心：表盘绘制 =================
 void drawWatchFace() {
     static float lastTemp = 0.0; 
-    float t_val, h_val;
-    if (shtc3_read(t_val, h_val)) {
-        lastTemp = t_val;
+    static uint64_t lastTempRead_us = 0; 
+    uint64_t now_us = esp_timer_get_time();
+    
+    if (!showSeconds || lastTempRead_us == 0 || (now_us - lastTempRead_us) > 60000000ULL) {
+        float t_val, h_val;
+        if (shtc3_read(t_val, h_val)) {
+            lastTemp = t_val;
+            lastTempRead_us = now_us;
+        }
     }
 
     canvas.fillScreen(C_WHITE);
@@ -207,162 +216,103 @@ void drawWatchFace() {
     t.tm_mon  = rtc.getMonth() - 1; 
     t.tm_year = rtc.getYear() - 1900;
 
-    // 框架
     canvas.fillRect(0, 90, 400, 3, C_BLACK);
     canvas.fillRect(0, 210, 400, 3, C_BLACK); 
     canvas.fillRect(199, 0, 3, 90, C_BLACK);
     canvas.fillRect(199, 210, 3, 90, C_BLACK);  
 
-    // 四角布局
-    int16_t x1, y1; uint16_t w, h;
-    char buf[40];
-    int pX = 15; 
-    int topLblY = 64; int topValY = 56; 
-    int botLblY = 222; int botValY = 266;
+    int16_t x1, y1; uint16_t w, h; char buf[40];
+    int pX = 15; int topLblY = 64; int topValY = 56; int botLblY = 222; int botValY = 266;
 
     auto drawLabel = [&](int x, int y, const char* label, bool alignRight) {
-        canvas.setFont(NULL);
-        canvas.setTextSize(2); 
+        canvas.setFont(NULL); canvas.setTextSize(2); 
         canvas.getTextBounds(label, 0, 0, &x1, &y1, &w, &h);
         int finalX = alignRight ? (W - w - pX) : x;
-        canvas.setCursor(finalX, y);
-        canvas.print(label);
+        canvas.setCursor(finalX, y); canvas.print(label);
     };
 
     auto drawValue = [&](int x, int y, const char* val, bool alignRight) {
-        canvas.setFont(&Orbitron_Medium_22);
-        canvas.setTextSize(1);
+        canvas.setFont(&Orbitron_Medium_22); canvas.setTextSize(1);
         canvas.getTextBounds(val, 0, 0, &x1, &y1, &w, &h);
         int finalX = alignRight ? (W - w - pX) : x;
-        canvas.setCursor(finalX, y);
-        canvas.print(val);
+        canvas.setCursor(finalX, y); canvas.print(val);
     };
 
-    char weekBuf[15];
-    strftime(weekBuf, 15, "%A", &t);
-    strupr(weekBuf);
-    drawValue(pX, topValY, weekBuf, false);
-    drawLabel(pX, topLblY, "WEEK", false);
+    char weekBuf[15]; strftime(weekBuf, 15, "%A", &t); strupr(weekBuf);
+    drawValue(pX, topValY, weekBuf, false); drawLabel(pX, topLblY, "WEEK", false);
     
     sprintf(buf, "%04d-%02d-%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
-    drawValue(0, topValY, buf, true); 
-    drawLabel(0, topLblY, "DATE", true);
+    drawValue(0, topValY, buf, true); drawLabel(0, topLblY, "DATE", true);
     
     drawLabel(pX, botLblY, "TEMP", false);
-    sprintf(buf, "%.1f C", lastTemp);
-    drawValue(pX, botValY, buf, false);
+    sprintf(buf, "%.1f C", lastTemp); drawValue(pX, botValY, buf, false);
 
     drawLabel(0, botLblY, "POWER", true);
-    int bat = getBatteryPercent();
-    sprintf(buf, "%d%%", bat);
+    int bat = getBatteryPercent(); sprintf(buf, "%d%%", bat);
     drawValue(0, botValY, buf, true);
 
-    // 时间显示
     if (showSeconds) {
-        int secBaseY = 185;
-        char timeStr[15];
+        int secBaseY = 185; char timeStr[15];
         sprintf(timeStr, "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
-        canvas.setFont(&DSEG7_Classic_Bold_36);
-        canvas.setTextSize(2); 
+        canvas.setFont(&DSEG7_Classic_Bold_36); canvas.setTextSize(2); 
         canvas.getTextBounds(timeStr, 0, 0, &x1, &y1, &w, &h);
-        int timeX = (W - w) / 2 - x1; 
-        canvas.setCursor(timeX, secBaseY); 
-        canvas.print(timeStr);
+        int timeX = (W - w) / 2 - x1; canvas.setCursor(timeX, secBaseY); canvas.print(timeStr);
     } else {
-        int noSecBaseY = 195;
-        canvas.setFont(&DSEG7_Classic_Bold_84);
-        canvas.setTextSize(1);
-        
-        char colon[] = ":";
-        canvas.getTextBounds(colon, 0, 0, &x1, &y1, &w, &h);
-        int colonX = (W - w) / 2 - x1; 
-        canvas.setCursor(colonX, noSecBaseY);
-        canvas.print(colon);
+        int noSecBaseY = 195; canvas.setFont(&DSEG7_Classic_Bold_84); canvas.setTextSize(1);
+        char colon[] = ":"; canvas.getTextBounds(colon, 0, 0, &x1, &y1, &w, &h);
+        int colonX = (W - w) / 2 - x1; canvas.setCursor(colonX, noSecBaseY); canvas.print(colon);
 
-        char hourStr[5];
-        sprintf(hourStr, "%02d", t.tm_hour);
-        canvas.getTextBounds(hourStr, 0, 0, &x1, &y1, &w, &h);
-        canvas.setCursor(180 - w - x1, noSecBaseY);
-        canvas.print(hourStr);
+        char hourStr[5]; sprintf(hourStr, "%02d", t.tm_hour);
+        canvas.getTextBounds(hourStr, 0, 0, &x1, &y1, &w, &h); canvas.setCursor(180 - w - x1, noSecBaseY); canvas.print(hourStr);
 
-        char minStr[5];
-        sprintf(minStr, "%02d", t.tm_min);
-        canvas.getTextBounds(minStr, 0, 0, &x1, &y1, &w, &h);
-        canvas.setCursor(220 - x1, noSecBaseY);
-        canvas.print(minStr);
+        char minStr[5]; sprintf(minStr, "%02d", t.tm_min);
+        canvas.getTextBounds(minStr, 0, 0, &x1, &y1, &w, &h); canvas.setCursor(220 - x1, noSecBaseY); canvas.print(minStr);
     }
 
     pushCanvasToRLCD();
 }
 
-// ================= Config 模式逻辑 =================
+// ================= Config 模式与按键逻辑 =================
 
 void startConfigMode() {
-    isConfigMode = true;
-    shouldSaveConfig = false; 
-    
+    isConfigMode = true; shouldSaveConfig = false; 
     showMessage("AP: RLCD-Clock"); 
-    
-    p_ntp->setValue(ntpServer, 40);
-    strcpy(secBuf, showSeconds ? "1" : "0");
-    p_sec->setValue(secBuf, 4);
-    
-    wm.setConfigPortalBlocking(false);
-    wm.startConfigPortal("RLCD-Clock");
+    p_ntp->setValue(ntpServer, 40); strcpy(secBuf, showSeconds ? "1" : "0"); p_sec->setValue(secBuf, 4);
+    wm.setConfigPortalBlocking(false); wm.startConfigPortal("RLCD-Clock");
 }
 
 void exitConfigMode() {
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
-    
-    isConfigMode = false;
-    showMessage("Exit AP Mode");
-    delay(1000);
-    drawWatchFace();
-    delay(50);
+    WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
+    isConfigMode = false; showMessage("Exit AP Mode"); delay(1000); drawWatchFace(); delay(50);
 }
 
-void click() { 
-    if(!isConfigMode) syncTime(); 
-}
+void click() { if(!isConfigMode) syncTime(); }
 
-void longPress() { 
-    if (!isConfigMode) {
-        startConfigMode();
-    } else {
-        exitConfigMode();
-    }
-}
+void longPress() { if (!isConfigMode) startConfigMode(); else exitConfigMode(); }
 
-// ================= 替代 OneButton 的自定义按键逻辑 =================
+// 普通循环中的按键处理逻辑
 void handleButton() {
-    delay(20); // 软件防抖
-    if (digitalRead(BUTTON_PIN) != LOW) return;
-
-    unsigned long pressTime = millis();
-    bool isLongPress = false;
-
+    delay(20); if (digitalRead(BUTTON_PIN) != LOW) return;
+    unsigned long pressTime = millis(); bool isLongPress = false;
     while (digitalRead(BUTTON_PIN) == LOW) {
-        if (millis() - pressTime > 800) { 
-            isLongPress = true;
-            break;
-        }
+        if (millis() - pressTime > 800) { isLongPress = true; break; }
         delay(10);
     }
-
-    if (isLongPress) {
-        longPress(); 
-        while(digitalRead(BUTTON_PIN) == LOW) delay(10); 
-    } else {
-        click();     
-        while(digitalRead(BUTTON_PIN) == LOW) delay(10); 
-    }
+    if (isLongPress) { longPress(); while(digitalRead(BUTTON_PIN) == LOW) delay(10); } 
+    else { click(); while(digitalRead(BUTTON_PIN) == LOW) delay(10); }
 }
 
 // ================= Arduino Setup & Loop =================
 void setup() {
+    // 无论是因为什么原因唤醒，第一件事必须是解除所有屏幕引脚的锁定
+    gpio_hold_dis((gpio_num_t)PIN_CS);
+    gpio_hold_dis((gpio_num_t)PIN_SCK);
+    gpio_hold_dis((gpio_num_t)PIN_MOSI);
+    gpio_hold_dis((gpio_num_t)PIN_DE);
+    gpio_hold_dis((gpio_num_t)PIN_DIS);
+    gpio_deep_sleep_hold_dis();
+
     Serial.begin(115200);
-    delay(500);
     Wire.begin(PIN_SDA, PIN_SCL);
     analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
 
@@ -370,11 +320,6 @@ void setup() {
     gpio_wakeup_enable((gpio_num_t)BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
     esp_sleep_enable_gpio_wakeup();
 
-    RlcdPort.RLCD_Init();
-    RlcdPort.RLCD_ColorClear(0xFF);
-    RlcdPort.RLCD_Display();
-    delay(50); // 确保初始化清屏画面显示完整
-    
     rtc.begin();
     analogReadResolution(12);
 
@@ -389,86 +334,120 @@ void setup() {
     strcpy(secBuf, showSeconds ? "1" : "0");
     p_sec = new WiFiManagerParameter("sec", "Show Seconds (1/0)", secBuf, 4);
 
-    wm.addParameter(p_ntp);
-    wm.addParameter(p_sec);
+    wm.addParameter(p_ntp); wm.addParameter(p_sec);
     wm.setSaveConfigCallback(saveConfigCallback);
     wm.setBreakAfterConfig(true); 
 
     setCpuFrequencyMhz(80); 
+
+    // 【核心修复】：无差别拦截！不管是因为什么开机的，只要开机瞬间按键被按下，立刻接管！
+    bool handled_in_setup = false;
     
-    // 【问题一修复】移除开机时的 drawWatchFace()，避免闪现旧时间界面
+    // 给一点时间让引脚电平稳定下来
+    delay(20); 
     
-    // 开机强制执行一次 NTP 同步
-    syncTime(); 
+    if (digitalRead(BUTTON_PIN) == LOW) {
+        // 先复原屏幕初始化，提供视觉反馈
+        RlcdPort.RLCD_Init();
+        RlcdPort.RLCD_ColorClear(0xFF);
+        RlcdPort.RLCD_Display();
+        delay(50); 
+        
+        // 持续检测是否长按
+        unsigned long pressTime = millis();
+        bool isLongPress = false;
+        while (digitalRead(BUTTON_PIN) == LOW) {
+            if (millis() - pressTime > 800) { isLongPress = true; break; }
+            delay(10);
+        }
+
+        // 判定结果后立即派发，完美避开阻塞耗时的开机 syncTime
+        if (isLongPress) {
+            longPress(); 
+            while(digitalRead(BUTTON_PIN) == LOW) delay(10);
+        } else {
+            click(); 
+            while(digitalRead(BUTTON_PIN) == LOW) delay(10);
+        }
+        
+        handled_in_setup = true; // 标记已经人工干预过了
+        rtc_isFirstBoot = false; 
+    }
+
+    // 如果开机时没有按键被按下，走正常的无人值守启动/深睡唤醒流程
+    if (!handled_in_setup) {
+        esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+        bool isDeepSleepWake = (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) && (!showSeconds);
+
+        if (rtc_isFirstBoot || !isDeepSleepWake) {
+            RlcdPort.RLCD_Init();
+            RlcdPort.RLCD_ColorClear(0xFF);
+            RlcdPort.RLCD_Display();
+            delay(50); 
+            syncTime(); // 正常无干预开机，执行必须的对时
+            rtc_isFirstBoot = false;
+        } else {
+            // 深睡分钟跳动唤醒，不刷屏，只检查是否到了凌晨0点需要对时
+            if (rtc.getHour() == 0 && rtc.getDay() != rtc_lastSyncDate) {
+                syncTime();
+            }
+        }
+    }
 }
 
 void loop() {
-    // 1. 优先处理按键唤醒或正常运行时的按键按下
+    // 正常状态下捕捉按键
     if (digitalRead(BUTTON_PIN) == LOW) {
         handleButton();
         return; 
     }
 
-    // 2. 配网模式处理
+    // 配网模式处理
     if (isConfigMode) {
         wm.process();
         if (shouldSaveConfig) {
             strncpy(ntpServer, p_ntp->getValue(), 40);
-            const char* secVal = p_sec->getValue();
-            showSeconds = (secVal[0] != '0');
-
-            prefs.begin("watch", false);
-            prefs.putString("ntp", ntpServer);
-            prefs.putBool("sec", showSeconds);
-            prefs.end();
-
-            showMessage("Saved!");
-            delay(1000);
-            isConfigMode = false;
-            WiFi.mode(WIFI_OFF); 
-            syncTime(); 
-            shouldSaveConfig = false;
+            showSeconds = (p_sec->getValue()[0] != '0');
+            prefs.begin("watch", false); prefs.putString("ntp", ntpServer); prefs.putBool("sec", showSeconds); prefs.end();
+            showMessage("Saved!"); delay(1000);
+            isConfigMode = false; WiFi.mode(WIFI_OFF); syncTime(); shouldSaveConfig = false;
         }
         delay(10);
         return; 
     }
 
-    // 3. 正常时钟模式
     uint64_t start_us = esp_timer_get_time();
-
-    int currentDay = rtc.getDay();
-    int currentHour = rtc.getHour();
-    
-    if (currentHour == 0 && currentDay != lastSyncDate) {
-        syncTime();
-    }
-
-    // 绘制屏幕
     drawWatchFace();
+    delay(50); 
 
-    // 等待 SPI DMA 传输完成，防止休眠切断时钟
-    delay(50);
+    uint64_t cost_us = esp_timer_get_time() - start_us; 
 
-    // 4. 计算休眠时长并进入 Light Sleep
-    uint64_t end_us = esp_timer_get_time();
-    uint64_t cost_us = end_us - start_us; 
-
-    uint64_t sleep_us = 0;
     if (showSeconds) {
-        sleep_us = 1000000ULL; 
-        if (sleep_us > cost_us) {
-            sleep_us -= cost_us; // 显秒时由于每秒都刷，必须减去耗时防止秒级漂移
-        } else {
-            sleep_us = 10000; 
-        }
+        // 【模式A】显秒：浅睡眠（Light Sleep）
+        uint64_t sleep_us = 1000000ULL; 
+        if (sleep_us > cost_us) sleep_us -= cost_us; else sleep_us = 10000; 
+        
+        esp_sleep_enable_timer_wakeup(sleep_us);
+        esp_light_sleep_start();
+        
     } else {
+        // 【模式B】不显秒：深度睡眠（Deep Sleep）
         int sec = rtc.getSecond();
-        sleep_us = (60 - sec) * 1000000ULL; 
-        // 【问题二修复】不显秒时，严禁减去 cost_us！
-        // 利用 RTC 读取的秒数形成负反馈闭环：强迫设备每次休眠唤醒都在真实的 "00~01 秒" 之间。
-        // 这样彻底杜绝了因微秒级漂移导致提前在 "59.9秒" 醒来而画错分钟的 Bug。
-    }
+        uint64_t sleep_us = (60 - sec) * 1000000ULL; 
+        if (sleep_us == 0) sleep_us = 60000000ULL;
+        
+        // 允许按键随时唤醒深睡
+        esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_PIN, 0); 
+        
+        // 强制锁住屏幕控制引脚电平
+        gpio_hold_en((gpio_num_t)PIN_CS);
+        gpio_hold_en((gpio_num_t)PIN_SCK);
+        gpio_hold_en((gpio_num_t)PIN_MOSI);
+        gpio_hold_en((gpio_num_t)PIN_DE);
+        gpio_hold_en((gpio_num_t)PIN_DIS);
+        gpio_deep_sleep_hold_en(); 
 
-    esp_sleep_enable_timer_wakeup(sleep_us);
-    esp_light_sleep_start();
+        esp_sleep_enable_timer_wakeup(sleep_us);
+        esp_deep_sleep_start(); 
+    }
 }
