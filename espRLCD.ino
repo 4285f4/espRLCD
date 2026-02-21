@@ -5,7 +5,7 @@
 #include <Preferences.h>
 #include <Adafruit_GFX.h>
 #include "time.h"
-#include "driver/gpio.h" // 引入底层 GPIO 库，用于深度睡眠时的引脚锁定
+#include "driver/gpio.h" 
 
 // 引入驱动、字体和 RTC 库
 #include "display_bsp.h"
@@ -25,19 +25,19 @@ bool shouldSaveConfig = false;
 // 配置参数
 char ntpServer[40] = "ntp.aliyun.com";
 bool showSeconds = true;
+// 【修改】数组大小改为 10（9个字符 + 1个结束符'\0'），默认文字改为刚好 9 个字符的
+char customMemo[10] = "WORK HARD"; 
 
 // WiFiManager 全局对象及参数指针
 WiFiManager wm;
 WiFiManagerParameter *p_ntp;
 WiFiManagerParameter *p_sec;
+WiFiManagerParameter *p_memo; 
 char secBuf[5];
 
 // 颜色定义
 #define C_BLACK 1
 #define C_WHITE 0
-
-// SHTC3 地址
-static const uint8_t SHTC3_ADDR = 0x70;
 
 // ================= 3. 硬件定义 =================
 #define PIN_CS    12
@@ -60,52 +60,7 @@ GFXcanvas1 canvas(W, H);
 Preferences prefs;
 PCF85063A rtc;
 
-// ================= 5. SHTC3 驱动函数 =================
-
-uint8_t crc8(const uint8_t *data, int len) {
-    uint8_t crc = 0xFF;
-    for (int i = 0; i < len; i++) {
-        crc ^= data[i];
-        for (int b = 0; b < 8; b++) {
-            crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x31) : (uint8_t)(crc << 1);
-        }
-    }
-    return crc;
-}
-
-bool shtc3_cmd(uint16_t cmd) {
-    Wire.beginTransmission(SHTC3_ADDR);
-    Wire.write((uint8_t)(cmd >> 8));
-    Wire.write((uint8_t)(cmd & 0xFF));
-    return Wire.endTransmission() == 0;
-}
-
-bool shtc3_read(float &tempC, float &rh) {
-    if (!shtc3_cmd(0x3517)) return false; 
-    delay(1);
-    if (!shtc3_cmd(0x7866)) return false; 
-    delay(20);
-
-    Wire.requestFrom((int)SHTC3_ADDR, 6);
-    if (Wire.available() != 6) return false;
-
-    uint8_t d[6];
-    for (int i = 0; i < 6; i++) d[i] = Wire.read();
-
-    if (crc8(&d[0], 2) != d[2]) return false;
-    if (crc8(&d[3], 2) != d[5]) return false;
-
-    uint16_t tRaw  = (uint16_t)d[0] << 8 | d[1];
-    uint16_t rhRaw = (uint16_t)d[3] << 8 | d[4];
-
-    tempC = -45.0f + 175.0f * (float)tRaw / 65535.0f;
-    rh    = 100.0f * (float)rhRaw / 65535.0f;
-
-    shtc3_cmd(0xB098); 
-    return true;
-}
-
-// ================= 6. 辅助函数 =================
+// ================= 5. 辅助函数 =================
 
 void saveConfigCallback() {
     shouldSaveConfig = true;
@@ -192,18 +147,6 @@ void syncTime() {
 
 // ================= 核心：表盘绘制 =================
 void drawWatchFace() {
-    static float lastTemp = 0.0; 
-    static uint64_t lastTempRead_us = 0; 
-    uint64_t now_us = esp_timer_get_time();
-    
-    if (!showSeconds || lastTempRead_us == 0 || (now_us - lastTempRead_us) > 60000000ULL) {
-        float t_val, h_val;
-        if (shtc3_read(t_val, h_val)) {
-            lastTemp = t_val;
-            lastTempRead_us = now_us;
-        }
-    }
-
     canvas.fillScreen(C_WHITE);
     canvas.setTextSize(1);
     
@@ -238,19 +181,28 @@ void drawWatchFace() {
         canvas.setCursor(finalX, y); canvas.print(val);
     };
 
+    // 左上：星期
     char weekBuf[15]; strftime(weekBuf, 15, "%A", &t); strupr(weekBuf);
     drawValue(pX, topValY, weekBuf, false); drawLabel(pX, topLblY, "WEEK", false);
     
+    // 右上：日期
     sprintf(buf, "%04d-%02d-%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
     drawValue(0, topValY, buf, true); drawLabel(0, topLblY, "DATE", true);
     
-    drawLabel(pX, botLblY, "TEMP", false);
-    sprintf(buf, "%.1f C", lastTemp); drawValue(pX, botValY, buf, false);
+    // 左下：自定义备忘录 (最大 9 字符)
+    char upperMemo[10]; // 【修改】缓冲区调整为 10
+    strncpy(upperMemo, customMemo, 9);
+    upperMemo[9] = '\0'; // 确保字符串正确结束
+    strupr(upperMemo); 
+    drawLabel(pX, botLblY, "MEMO", false);
+    drawValue(pX, botValY, upperMemo, false);
 
+    // 右下：电量
     drawLabel(0, botLblY, "POWER", true);
     int bat = getBatteryPercent(); sprintf(buf, "%d%%", bat);
     drawValue(0, botValY, buf, true);
 
+    // 中间：时间
     if (showSeconds) {
         int secBaseY = 185; char timeStr[15];
         sprintf(timeStr, "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
@@ -277,8 +229,13 @@ void drawWatchFace() {
 void startConfigMode() {
     isConfigMode = true; shouldSaveConfig = false; 
     showMessage("AP: RLCD-Clock"); 
-    p_ntp->setValue(ntpServer, 40); strcpy(secBuf, showSeconds ? "1" : "0"); p_sec->setValue(secBuf, 4);
-    wm.setConfigPortalBlocking(false); wm.startConfigPortal("RLCD-Clock");
+    
+    p_ntp->setValue(ntpServer, 40); 
+    strcpy(secBuf, showSeconds ? "1" : "0"); p_sec->setValue(secBuf, 4);
+    p_memo->setValue(customMemo, 10); // 【修改】传递给网页的长度限制为 10
+
+    wm.setConfigPortalBlocking(false); 
+    wm.startConfigPortal("RLCD-Clock");
 }
 
 void exitConfigMode() {
@@ -290,7 +247,6 @@ void click() { if(!isConfigMode) syncTime(); }
 
 void longPress() { if (!isConfigMode) startConfigMode(); else exitConfigMode(); }
 
-// 普通循环中的按键处理逻辑
 void handleButton() {
     delay(20); if (digitalRead(BUTTON_PIN) != LOW) return;
     unsigned long pressTime = millis(); bool isLongPress = false;
@@ -304,7 +260,6 @@ void handleButton() {
 
 // ================= Arduino Setup & Loop =================
 void setup() {
-    // 无论是因为什么原因唤醒，第一件事必须是解除所有屏幕引脚的锁定
     gpio_hold_dis((gpio_num_t)PIN_CS);
     gpio_hold_dis((gpio_num_t)PIN_SCK);
     gpio_hold_dis((gpio_num_t)PIN_MOSI);
@@ -323,37 +278,42 @@ void setup() {
     rtc.begin();
     analogReadResolution(12);
 
+    // 读取首选项
     prefs.begin("watch", true);
     if(prefs.isKey("ntp")) {
         prefs.getString("ntp", "ntp.aliyun.com").toCharArray(ntpServer, 40);
         showSeconds = prefs.getBool("sec", true);
+        if(prefs.isKey("memo")) {
+            // 【修改】读取时限制最多载入 10 字节
+            prefs.getString("memo", "WORK HARD").toCharArray(customMemo, 10); 
+        }
     }
     prefs.end();
 
     p_ntp = new WiFiManagerParameter("ntp", "NTP Server", ntpServer, 40);
     strcpy(secBuf, showSeconds ? "1" : "0");
     p_sec = new WiFiManagerParameter("sec", "Show Seconds (1/0)", secBuf, 4);
+    // 【修改】网页提示文字更新为 Max 9 chars，HTML 输入框最大长度限制为 10
+    p_memo = new WiFiManagerParameter("memo", "Custom Memo (Max 9 chars)", customMemo, 10);
 
-    wm.addParameter(p_ntp); wm.addParameter(p_sec);
+    wm.addParameter(p_ntp); 
+    wm.addParameter(p_sec);
+    wm.addParameter(p_memo); 
     wm.setSaveConfigCallback(saveConfigCallback);
     wm.setBreakAfterConfig(true); 
 
     setCpuFrequencyMhz(80); 
 
-    // 【核心修复】：无差别拦截！不管是因为什么开机的，只要开机瞬间按键被按下，立刻接管！
     bool handled_in_setup = false;
-    
-    // 给一点时间让引脚电平稳定下来
     delay(20); 
     
+    // 【按键拦截逻辑】通电开机瞬间接管
     if (digitalRead(BUTTON_PIN) == LOW) {
-        // 先复原屏幕初始化，提供视觉反馈
         RlcdPort.RLCD_Init();
         RlcdPort.RLCD_ColorClear(0xFF);
         RlcdPort.RLCD_Display();
         delay(50); 
         
-        // 持续检测是否长按
         unsigned long pressTime = millis();
         bool isLongPress = false;
         while (digitalRead(BUTTON_PIN) == LOW) {
@@ -361,7 +321,6 @@ void setup() {
             delay(10);
         }
 
-        // 判定结果后立即派发，完美避开阻塞耗时的开机 syncTime
         if (isLongPress) {
             longPress(); 
             while(digitalRead(BUTTON_PIN) == LOW) delay(10);
@@ -370,11 +329,11 @@ void setup() {
             while(digitalRead(BUTTON_PIN) == LOW) delay(10);
         }
         
-        handled_in_setup = true; // 标记已经人工干预过了
+        handled_in_setup = true;
         rtc_isFirstBoot = false; 
     }
 
-    // 如果开机时没有按键被按下，走正常的无人值守启动/深睡唤醒流程
+    // 正常启动或定时器深睡唤醒
     if (!handled_in_setup) {
         esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
         bool isDeepSleepWake = (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) && (!showSeconds);
@@ -384,10 +343,9 @@ void setup() {
             RlcdPort.RLCD_ColorClear(0xFF);
             RlcdPort.RLCD_Display();
             delay(50); 
-            syncTime(); // 正常无干预开机，执行必须的对时
+            syncTime(); 
             rtc_isFirstBoot = false;
         } else {
-            // 深睡分钟跳动唤醒，不刷屏，只检查是否到了凌晨0点需要对时
             if (rtc.getHour() == 0 && rtc.getDay() != rtc_lastSyncDate) {
                 syncTime();
             }
@@ -396,19 +354,26 @@ void setup() {
 }
 
 void loop() {
-    // 正常状态下捕捉按键
     if (digitalRead(BUTTON_PIN) == LOW) {
         handleButton();
         return; 
     }
 
-    // 配网模式处理
     if (isConfigMode) {
         wm.process();
         if (shouldSaveConfig) {
             strncpy(ntpServer, p_ntp->getValue(), 40);
             showSeconds = (p_sec->getValue()[0] != '0');
-            prefs.begin("watch", false); prefs.putString("ntp", ntpServer); prefs.putBool("sec", showSeconds); prefs.end();
+            // 【修改】网页抓取数据时严格限制最多拷贝 9 个字符
+            strncpy(customMemo, p_memo->getValue(), 9); 
+            customMemo[9] = '\0'; // 安全截断，保证字符串不越界
+
+            prefs.begin("watch", false); 
+            prefs.putString("ntp", ntpServer); 
+            prefs.putBool("sec", showSeconds); 
+            prefs.putString("memo", customMemo); 
+            prefs.end();
+
             showMessage("Saved!"); delay(1000);
             isConfigMode = false; WiFi.mode(WIFI_OFF); syncTime(); shouldSaveConfig = false;
         }
@@ -436,10 +401,8 @@ void loop() {
         uint64_t sleep_us = (60 - sec) * 1000000ULL; 
         if (sleep_us == 0) sleep_us = 60000000ULL;
         
-        // 允许按键随时唤醒深睡
         esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_PIN, 0); 
         
-        // 强制锁住屏幕控制引脚电平
         gpio_hold_en((gpio_num_t)PIN_CS);
         gpio_hold_en((gpio_num_t)PIN_SCK);
         gpio_hold_en((gpio_num_t)PIN_MOSI);
